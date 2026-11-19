@@ -1,6 +1,5 @@
-# Home Assistant add-on Dockerfile
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:latest
-FROM ${BUILD_FROM}
+# Home Assistant app Dockerfile
+FROM ghcr.io/home-assistant/base:latest
 
 # Set shell for add-on compatibility
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
