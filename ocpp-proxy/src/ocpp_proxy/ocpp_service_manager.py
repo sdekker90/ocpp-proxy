@@ -1,197 +1,209 @@
-import asyncio
-import logging
-from typing import TYPE_CHECKING, Any, cast
+"""Configuration and shared state for upstream OCPP services (CSMS such as Monta or Zeres)."""
 
-import websockets
+import base64
+import json
+import logging
+import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
+
+import aiohttp
 
 if TYPE_CHECKING:
-    from websockets.typing import Subprotocol
-else:
-    Subprotocol = str
-
-from .charge_point_factory import OCPPServiceFactory
+    from .relay import ChargerRelay
 
 _LOGGER = logging.getLogger(__name__)
 
+CHARGE_POINT_ID_PLACEHOLDER = "{charge_point_id}"
+
+
+@dataclass(frozen=True)
+class ServiceConfig:
+    """One upstream OCPP service the charger is relayed to."""
+
+    service_id: str
+    url: str
+    primary: bool = False
+    read_only: bool = True
+    auth_type: str = "none"
+    username: str | None = None
+    password: str | None = None
+    token: str | None = None
+
+    def url_for(self, cp_id: str) -> str:
+        """Build the service URL for a charger, like the charger itself would.
+
+        A charger appends its own ID to the configured OCPP URL; the proxy does the same.
+        Use ``{charge_point_id}`` in the URL to place the ID somewhere else.
+        """
+        quoted = quote(cp_id, safe="")
+        if CHARGE_POINT_ID_PLACEHOLDER in self.url:
+            return self.url.replace(CHARGE_POINT_ID_PLACEHOLDER, quoted)
+        return f"{self.url.rstrip('/')}/{quoted}"
+
+    def headers_for(self, cp_id: str) -> dict[str, str]:
+        """Return authentication headers for the connection."""
+        if self.auth_type == "basic" and self.password:
+            # OCPP security profile 1: the username is the charge point ID by default.
+            username = self.username or cp_id
+            credentials = base64.b64encode(f"{username}:{self.password}".encode()).decode()
+            return {"Authorization": f"Basic {credentials}"}
+        if self.auth_type == "token" and self.token:
+            return {"Authorization": f"Bearer {self.token}"}
+        return {}
+
+
+def parse_services(raw_services: list[dict[str, Any]]) -> list[ServiceConfig]:
+    """Turn add-on options into service configs, choosing exactly one primary."""
+    enabled = []
+    for raw in raw_services:
+        if not raw.get("enabled", True):
+            continue
+        if not raw.get("id") or not raw.get("url"):
+            _LOGGER.error("Ignoring OCPP service without id or url: %s", raw.get("id"))
+            continue
+        enabled.append(raw)
+
+    flagged = [raw["id"] for raw in enabled if raw.get("primary")]
+    if len(flagged) > 1:
+        _LOGGER.warning("Multiple primary OCPP services %s; using %s", flagged, flagged[0])
+    primary_id = flagged[0] if flagged else (enabled[0]["id"] if enabled else None)
+
+    services = []
+    for raw in enabled:
+        is_primary = raw["id"] == primary_id
+        services.append(
+            ServiceConfig(
+                service_id=str(raw["id"]),
+                url=str(raw["url"]),
+                primary=is_primary,
+                read_only=bool(raw.get("read_only", not is_primary)),
+                auth_type=str(raw.get("auth_type") or "none"),
+                username=raw.get("username") or None,
+                password=raw.get("password") or None,
+                token=raw.get("token") or None,
+            )
+        )
+    return services
+
+
+class TransactionStore:
+    """Maps the transaction IDs the charger knows to the IDs each service issued.
+
+    Persisted to disk so an add-on restart during a charging session does not lose the
+    mapping needed to deliver StopTransaction to each service.
+    """
+
+    def __init__(self, path: str | None = None) -> None:
+        self._path = path
+        self._map: dict[str, dict[str, int]] = {}
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    self._map = loaded
+            except (OSError, ValueError):
+                _LOGGER.exception("Could not read transaction map %s", path)
+
+    def get(self, service_id: str, charger_tx: int) -> int | None:
+        """Return the service's transaction ID for a charger transaction ID."""
+        return self._map.get(service_id, {}).get(str(charger_tx))
+
+    def reverse(self, service_id: str, service_tx: int) -> int | None:
+        """Return the charger transaction ID for a service's transaction ID."""
+        for charger_tx, mapped in self._map.get(service_id, {}).items():
+            if mapped == service_tx:
+                return int(charger_tx)
+        return None
+
+    def set(self, service_id: str, charger_tx: int, service_tx: int) -> None:
+        """Record a mapping."""
+        self._map.setdefault(service_id, {})[str(charger_tx)] = service_tx
+        self._save()
+
+    def remove(self, service_id: str, charger_tx: int) -> None:
+        """Forget a mapping once the transaction is finished."""
+        if self._map.get(service_id, {}).pop(str(charger_tx), None) is not None:
+            self._save()
+
+    def _save(self) -> None:
+        if not self._path:
+            return
+        tmp_path = f"{self._path}.tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(self._map, f)
+            os.replace(tmp_path, self._path)
+        except OSError:
+            _LOGGER.exception("Could not write transaction map %s", self._path)
+
 
 class OCPPServiceManager:
-    """
-    Manages outbound connections to OCPP services.
-    Handles authentication, connection lifecycle, and message routing.
-    Supports both OCPP 1.6 and 2.0.1 versions.
+    """Holds upstream service configuration and the state shared across charger connections.
+
+    Connections to the services are opened per charger connection by ``ChargerRelay``,
+    because the URL depends on the charger's ID.
     """
 
     def __init__(self, config: Any, backend_manager: Any = None) -> None:
         self.config = config
         self.backend_manager = backend_manager
-        self.services: dict[str, Any] = {}
-        self._connection_tasks: dict[str, asyncio.Task[Any]] = {}
-        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self.services = parse_services(list(getattr(config, "ocpp_services", []) or []))
+        self.tx_store = TransactionStore(os.getenv("TX_MAP_PATH"))
+        self._session: aiohttp.ClientSession | None = None
+        self._relay: ChargerRelay | None = None
+
+    @property
+    def primary(self) -> ServiceConfig | None:
+        """The service whose answers are passed back to the charger."""
+        return next((s for s in self.services if s.primary), None)
 
     async def start_services(self) -> None:
-        """Start connections to all configured OCPP services."""
-        if not hasattr(self.config, "ocpp_services"):
-            _LOGGER.info("No OCPP services configured")
-            return
-
-        for service_config in self.config.ocpp_services:
-            service_id = service_config.get("id")
-            if service_id and service_config.get("enabled", True):
-                await self.connect_service(service_id, service_config)
-
-    async def connect_service(self, service_id: str, service_config: dict[str, Any]) -> None:
-        """Connect to a specific OCPP service."""
-        try:
-            url = service_config.get("url")
-            if not url:
-                _LOGGER.error(f"No URL configured for OCPP service {service_id}")
-                return
-
-            # Determine OCPP version (default to 1.6 if not specified)
-            version = service_config.get("version", "1.6")
-
-            # Handle authentication
-            auth_headers = {}
-            if service_config.get("auth_type") == "basic":
-                username = service_config.get("username")
-                password = service_config.get("password")
-                if username and password:
-                    import base64
-
-                    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-                    auth_headers["Authorization"] = f"Basic {credentials}"
-            elif service_config.get("auth_type") == "token":
-                token = service_config.get("token")
-                if token:
-                    auth_headers["Authorization"] = f"Bearer {token}"
-
-            # Set WebSocket subprotocol based on version
-            subprotocols: list[Subprotocol] = []
-            if version == "1.6":
-                subprotocols = [cast("Subprotocol", "ocpp1.6")]
-            elif version == "2.0.1":
-                subprotocols = [cast("Subprotocol", "ocpp2.0.1")]
-
-            # Create WebSocket connection
-            connection = await websockets.connect(
-                url,
-                extra_headers=auth_headers,
-                subprotocols=subprotocols,
-                ping_interval=30,
-                ping_timeout=10,
+        """Log the configured services; connections open once the charger connects."""
+        if not self.services:
+            _LOGGER.info("No OCPP services configured; the proxy answers the charger itself")
+        for service in self.services:
+            role = "primary" if service.primary else "secondary"
+            access = "read-only" if service.read_only else "control"
+            _LOGGER.info(
+                "OCPP service %s (%s, %s): %s", service.service_id, role, access, service.url
             )
 
-            # Create OCPP client using factory
-            client = OCPPServiceFactory.create_service_client(
-                service_id, connection, version, manager=self
-            )
-            self.services[service_id] = client
+    async def get_session(self) -> aiohttp.ClientSession:
+        """Return the shared HTTP session for outbound WebSocket connections."""
+        if self._session is None or self._session.closed:
+            # The timeout covers the WebSocket handshake, not the open connection.
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        return self._session
 
-            # Start the client in a background task
-            task = asyncio.create_task(client.start())
-            self._connection_tasks[service_id] = task
+    def attach(self, relay: "ChargerRelay") -> None:
+        """Register the relay of the currently connected charger."""
+        self._relay = relay
 
-            _LOGGER.info(f"Connecting to OCPP {version} service {service_id} at {url}")
-
-        except Exception:
-            _LOGGER.exception(f"Failed to connect to OCPP service {service_id}")
-
-    async def disconnect_service(self, service_id: str) -> None:
-        """Disconnect from a specific OCPP service."""
-        if service_id in self.services:
-            client = self.services[service_id]
-
-            # Cancel connection task
-            if service_id in self._connection_tasks:
-                self._connection_tasks[service_id].cancel()
-                del self._connection_tasks[service_id]
-
-            # Close WebSocket connection
-            if hasattr(client, "_connection"):
-                await client._connection.close()
-
-            del self.services[service_id]
-            _LOGGER.info(f"Disconnected from OCPP service {service_id}")
-
-    async def request_control_from_service(
-        self, service_id: str, action: str, params: dict[str, Any]
-    ) -> bool:
-        """Handle control request from an OCPP service."""
-        if not self.backend_manager:
-            return False
-
-        # Treat OCPP services as special backend clients
-        success = await self.backend_manager.request_control(f"ocpp_service_{service_id}")
-
-        if success and hasattr(self.backend_manager, "_app"):
-            # Forward the request to the charge point
-            cp = self.backend_manager._app.get("charge_point")
-            if cp:
-                try:
-                    if action == "RemoteStartTransaction":
-                        result = await cp.send_remote_start_transaction(
-                            connector_id=params.get("connector_id", 1), id_tag=params.get("id_tag")
-                        )
-                        return bool(result)
-                    if action == "RemoteStopTransaction":
-                        result = await cp.send_remote_stop_transaction(
-                            transaction_id=params.get("transaction_id")
-                        )
-                        return bool(result)
-                except Exception:
-                    _LOGGER.exception(f"Error forwarding {action} from service {service_id}")
-
-        return False
-
-    def broadcast_event_to_services(self, event: dict[str, Any]) -> None:
-        """Broadcast charger events to all connected OCPP services."""
-        for client in self.services.values():
-            if hasattr(client, "connected") and client.connected:
-                task = asyncio.create_task(self._send_event_to_service(client, event))
-                # Store reference to prevent task being garbage collected
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-
-    async def _send_event_to_service(self, client: Any, event: dict[str, Any]) -> None:
-        """Send a specific event to an OCPP service."""
-        try:
-            event_type = event.get("type")
-
-            # The ChargePoint implementations handle the actual message sending
-            # We just need to forward the events to the service clients
-            if event_type == "status":
-                # Services receive status updates passively
-                pass
-            elif event_type == "meter":
-                # Services receive meter values passively
-                pass
-            elif event_type == "transaction_started" or event_type == "transaction_stopped":
-                # Services receive transaction events passively
-                pass
-            elif event_type == "heartbeat":
-                # Services receive heartbeat events passively
-                pass
-            elif event_type == "boot":
-                # Services receive boot notifications passively
-                pass
-
-        except Exception:
-            _LOGGER.exception(
-                f"Error sending event to service {getattr(client, 'service_id', 'unknown')}"
-            )
+    def detach(self, relay: "ChargerRelay") -> None:
+        """Unregister a relay when its charger disconnects."""
+        if self._relay is relay:
+            self._relay = None
 
     async def stop_all_services(self) -> None:
-        """Stop all OCPP service connections."""
-        for service_id in list(self.services.keys()):
-            await self.disconnect_service(service_id)
+        """Close all upstream connections."""
+        if self._relay is not None:
+            await self._relay.close_links()
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
 
     def get_service_status(self) -> dict[str, dict[str, Any]]:
-        """Get status of all OCPP services."""
-        status = {}
-        for service_id, client in self.services.items():
-            status[service_id] = {
-                "connected": getattr(client, "connected", False),
-                "authenticated": getattr(client, "authenticated", False),
-                "version": getattr(client, "ocpp_version", "unknown"),
+        """Return the connection state of every configured service."""
+        if self._relay is not None:
+            return self._relay.link_status()
+        return {
+            s.service_id: {
+                "connected": False,
+                "primary": s.primary,
+                "read_only": s.read_only,
+                "url": s.url,
             }
-        return status
+            for s in self.services
+        }

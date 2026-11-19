@@ -24,9 +24,7 @@ COPY pyproject.toml poetry.lock* ./
 # Install Python dependencies with break-system-packages flag
 RUN \
     pip3 install --break-system-packages \
-        "ocpp>=2.0.0" \
         "aiohttp>=3.9.0" \
-        "websockets>=12.0" \
         "PyYAML>=6.0.0" \
     && apk del .build-dependencies
 

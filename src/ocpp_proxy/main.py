@@ -7,39 +7,49 @@ import os
 from aiohttp import WSCloseCode, web
 
 from .backend_manager import BackendManager
-from .charge_point_factory import ChargePointFactory
 from .config import Config
 from .ha_bridge import HABridge
 from .logger import EventLogger
 from .ocpp_service_manager import OCPPServiceManager
+from .relay import ChargerRelay, version_from_subprotocol
 
 _LOGGER = logging.getLogger(__name__)
 
+OCPP_SUBPROTOCOLS = ("ocpp1.6", "ocpp2.0.1")
+
 
 async def charger_handler(request: web.Request) -> web.WebSocketResponse:
-    """Handle WebSocket connection from the EV charger (CSMS role)."""
-    ws = web.WebSocketResponse()
+    """Handle the EV charger connection (the proxy acts as its CSMS) and relay it upstream."""
+    # Chargers connect to /charger/<chargePointId> (OCPP-J convention) and require the
+    # server to confirm the OCPP subprotocol during the handshake.
+    ws = web.WebSocketResponse(protocols=OCPP_SUBPROTOCOLS)
     await ws.prepare(request)
 
-    config = request.app["config"]
-    cp = ChargePointFactory.create_charge_point(
-        "CP-1",
+    cp_id = request.match_info.get("cp_id") or request.query.get("id") or "CP-1"
+    version = version_from_subprotocol(ws.ws_protocol, request.app["config"].ocpp_version)
+    relay = ChargerRelay(
+        cp_id,
         ws,
-        version=config.ocpp_version,
+        version,
+        request.app["ocpp_service_manager"],
         manager=request.app["backend_manager"],
         ha_bridge=request.app["ha_bridge"],
         event_logger=request.app["event_logger"],
-        auto_detect=config.auto_detect_ocpp_version,
     )
-    # store active charge point for proxying control requests
-    request.app["charge_point"] = cp
-    _LOGGER.info(f"Charger connected using OCPP {cp.ocpp_version}")
+    # store active charger for proxying control requests from /backend clients
+    request.app["charge_point"] = relay
+    _LOGGER.info(
+        "Charger %s connected using OCPP %s (subprotocol: %s)", cp_id, version, ws.ws_protocol
+    )
     try:
-        await cp.start()
+        await relay.run()
     except Exception:
         _LOGGER.exception("Charger handler error")
     finally:
+        if request.app.get("charge_point") is relay:
+            request.app.pop("charge_point")
         await ws.close(code=WSCloseCode.GOING_AWAY)
+        _LOGGER.info("Charger %s disconnected", cp_id)
     return ws
 
 
@@ -198,10 +208,12 @@ async def init_app() -> web.Application:
     # Start OCPP service connections
     await ocpp_service_manager.start_services()
 
+    app.on_cleanup.append(cleanup_app)
     app.add_routes(
         [
             web.get("/", welcome_handler),
             web.get("/charger", charger_handler),
+            web.get("/charger/{cp_id}", charger_handler),
             web.get("/backend", backend_handler),
             web.get("/sessions", sessions_json),
             web.get("/sessions.csv", sessions_csv),
@@ -222,8 +234,6 @@ def main() -> None:
     """Entrypoint for the proxy server."""
     logging.basicConfig(level=logging.INFO)
     app = asyncio.run(init_app())
-    # Add cleanup handler
-    app.on_cleanup.append(cleanup_app)
     web.run_app(app, port=int(os.getenv("PORT", 9000)))
 
 

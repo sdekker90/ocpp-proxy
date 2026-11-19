@@ -45,8 +45,10 @@ class BackendManager:
             self.release_control()
 
     async def broadcast_event(self, event: Any) -> None:
-        """Forward charger event to all subscribers via WebSocket and OCPP services."""
-        # Broadcast to WebSocket subscribers
+        """Forward charger event to all WebSocket subscribers.
+
+        Upstream OCPP services receive the charger's raw OCPP messages from the relay.
+        """
         for ws in list(self.subscribers.values()):
             # best-effort send; ignore failures
             try:
@@ -54,10 +56,6 @@ class BackendManager:
             except Exception as e:
                 _LOGGER.debug(f"Failed to send event to backend: {e}")
                 continue
-
-        # Broadcast to OCPP services
-        if self.ocpp_service_manager:
-            self.ocpp_service_manager.broadcast_event_to_services(event)
 
     async def request_control(self, backend_id: str) -> bool:
         """Attempt to acquire or preempt control for a backend, enforcing safety rules."""

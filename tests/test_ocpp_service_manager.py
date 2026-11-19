@@ -1,475 +1,180 @@
-from unittest.mock import AsyncMock, Mock, patch
+import base64
+import json
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from src.ocpp_proxy.config import Config
-from src.ocpp_proxy.ocpp_service_manager import OCPPServiceManager
+from src.ocpp_proxy.ocpp_service_manager import (
+    OCPPServiceManager,
+    ServiceConfig,
+    TransactionStore,
+    parse_services,
+)
 
 
+@pytest.mark.unit
+class TestParseServices:
+    def test_first_enabled_service_is_primary_by_default(self):
+        services = parse_services(
+            [
+                {"id": "off", "url": "wss://off", "enabled": False},
+                {"id": "monta", "url": "wss://monta"},
+                {"id": "zeres", "url": "wss://zeres"},
+            ]
+        )
+        assert [s.service_id for s in services] == ["monta", "zeres"]
+        assert services[0].primary
+        assert not services[0].read_only
+        assert not services[1].primary
+        assert services[1].read_only
+
+    def test_explicit_primary_and_read_only_override(self):
+        services = parse_services(
+            [
+                {"id": "zeres", "url": "wss://zeres", "read_only": False},
+                {"id": "monta", "url": "wss://monta", "primary": True},
+            ]
+        )
+        by_id = {s.service_id: s for s in services}
+        assert by_id["monta"].primary
+        assert not by_id["zeres"].primary
+        assert not by_id["zeres"].read_only
+
+    def test_multiple_primaries_uses_first(self):
+        services = parse_services(
+            [
+                {"id": "a", "url": "wss://a", "primary": True},
+                {"id": "b", "url": "wss://b", "primary": True},
+            ]
+        )
+        assert [s.primary for s in services] == [True, False]
+
+    def test_services_without_id_or_url_are_ignored(self):
+        assert parse_services([{"id": "x"}, {"url": "wss://y"}]) == []
+
+    def test_auth_fields(self):
+        (service,) = parse_services(
+            [{"id": "a", "url": "wss://a", "auth_type": "basic", "password": "pw", "username": ""}]
+        )
+        assert service.auth_type == "basic"
+        assert service.password == "pw"
+        assert service.username is None
+
+
+@pytest.mark.unit
+class TestServiceConfig:
+    def test_charger_id_is_appended(self):
+        service = ServiceConfig("monta", "wss://ocpp.example.com/")
+        assert service.url_for("7000730523000060") == "wss://ocpp.example.com/7000730523000060"
+
+    def test_charger_id_placeholder(self):
+        service = ServiceConfig("monta", "wss://ocpp.example.com/{charge_point_id}/ws")
+        assert service.url_for("CP 1") == "wss://ocpp.example.com/CP%201/ws"
+
+    def test_basic_auth_defaults_username_to_charger_id(self):
+        headers = ServiceConfig("a", "wss://a", auth_type="basic", password="pw").headers_for("CP1")
+        assert headers["Authorization"] == "Basic " + base64.b64encode(b"CP1:pw").decode()
+
+    def test_basic_auth_with_username(self):
+        service = ServiceConfig("a", "wss://a", auth_type="basic", username="u", password="pw")
+        expected = "Basic " + base64.b64encode(b"u:pw").decode()
+        assert service.headers_for("CP1")["Authorization"] == expected
+
+    def test_token_auth(self):
+        service = ServiceConfig("a", "wss://a", auth_type="token", token="abc")
+        assert service.headers_for("CP1") == {"Authorization": "Bearer abc"}
+
+    def test_no_auth(self):
+        assert ServiceConfig("a", "wss://a").headers_for("CP1") == {}
+        assert ServiceConfig("a", "wss://a", auth_type="basic").headers_for("CP1") == {}
+
+
+@pytest.mark.unit
+class TestTransactionStore:
+    def test_in_memory_mapping(self):
+        store = TransactionStore()
+        store.set("monta", 1000, 501)
+        assert store.get("monta", 1000) == 501
+        assert store.get("zeres", 1000) is None
+        assert store.reverse("monta", 501) == 1000
+        assert store.reverse("monta", 999) is None
+        store.remove("monta", 1000)
+        assert store.get("monta", 1000) is None
+        store.remove("monta", 1000)  # removing twice is fine
+
+    def test_persists_across_instances(self, tmp_path):
+        path = str(tmp_path / "tx.json")
+        TransactionStore(path).set("monta", 1000, 501)
+        assert TransactionStore(path).get("monta", 1000) == 501
+        with open(path) as f:
+            assert json.load(f) == {"monta": {"1000": 501}}
+
+    def test_corrupt_file_is_ignored(self, tmp_path):
+        path = tmp_path / "tx.json"
+        path.write_text("{not json")
+        store = TransactionStore(str(path))
+        assert store.get("monta", 1) is None
+
+    def test_unwritable_path_does_not_raise(self, tmp_path):
+        store = TransactionStore(str(tmp_path / "missing-dir" / "tx.json"))
+        store.set("monta", 1, 2)
+        assert store.get("monta", 1) == 2
+
+
+@pytest.mark.unit
 class TestOCPPServiceManager:
-    """Unit tests for OCPPServiceManager class."""
-
-    @pytest.fixture
-    def mock_config(self):
-        """Create a mock config object."""
-        config = Mock(spec=Config)
-        config.ocpp_services = [
-            {
-                "id": "service1",
-                "url": "wss://service1.com/ocpp",
-                "auth_type": "token",
-                "token": "token123",
-                "enabled": True,
-            },
-            {
-                "id": "service2",
-                "url": "wss://service2.com/ocpp",
-                "auth_type": "basic",
-                "username": "user",
-                "password": "pass",
-                "enabled": True,
-            },
-            {
-                "id": "service3",
-                "url": "wss://service3.com/ocpp",
-                "auth_type": "none",
-                "enabled": False,
-            },
-        ]
+    def make_config(self, services):
+        config = Mock()
+        config.ocpp_services = services
         return config
 
-    @pytest.fixture
-    def mock_backend_manager(self):
-        """Create a mock backend manager."""
-        manager = Mock()
-        manager.request_control = AsyncMock(return_value=True)
-        manager._app = {"charge_point": Mock()}
-        return manager
-
-    @pytest.fixture
-    def service_manager(self, mock_config, mock_backend_manager):
-        """Create an OCPPServiceManager instance for testing."""
-        return OCPPServiceManager(mock_config, mock_backend_manager)
-
-    @pytest.mark.unit
-    def test_initialization(self, service_manager, mock_config, mock_backend_manager):
-        """Test OCPPServiceManager initialization."""
-        assert service_manager.config == mock_config
-        assert service_manager.backend_manager == mock_backend_manager
-        assert service_manager.services == {}
-        assert service_manager._connection_tasks == {}
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_start_services_no_config(self, mock_backend_manager):
-        """Test starting services with no OCPP services configured."""
-        config = Mock(spec=Config)
-        # Mock config without ocpp_services attribute
-        del config.ocpp_services  # Remove the attribute entirely
-        service_manager = OCPPServiceManager(config, mock_backend_manager)
-
-        # Should not raise exception
-        await service_manager.start_services()
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_start_services_empty_config(self, mock_backend_manager):
-        """Test starting services with empty OCPP services list."""
-        config = Mock(spec=Config)
-        config.ocpp_services = []
-        service_manager = OCPPServiceManager(config, mock_backend_manager)
-
-        # Should not raise exception
-        await service_manager.start_services()
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_connect_service_token_auth(self, service_manager):
-        """Test connecting to service with token authentication."""
-        service_config = {
-            "id": "test_service",
-            "url": "wss://test.com/ocpp",
-            "auth_type": "token",
-            "token": "test_token",
+    async def test_status_without_charger(self):
+        manager = OCPPServiceManager(
+            self.make_config([{"id": "monta", "url": "wss://monta"}, {"id": "z", "url": "wss://z"}])
+        )
+        await manager.start_services()
+        assert manager.primary is not None
+        assert manager.primary.service_id == "monta"
+        status = manager.get_service_status()
+        assert status["monta"] == {
+            "connected": False,
+            "primary": True,
+            "read_only": False,
+            "url": "wss://monta",
         }
-
-        with (
-            patch(
-                "src.ocpp_proxy.ocpp_service_manager.websockets.connect", new_callable=AsyncMock
-            ) as mock_connect,
-            patch(
-                "src.ocpp_proxy.ocpp_service_manager.OCPPServiceFactory.create_service_client"
-            ) as mock_factory,
-        ):
-            mock_connection = Mock()
-            mock_connect.return_value = mock_connection
-            mock_client = Mock()
-            mock_client.start = AsyncMock()
-            mock_factory.return_value = mock_client
-
-            await service_manager.connect_service("test_service", service_config)
-
-            # Should connect with correct headers
-            mock_connect.assert_called_once_with(
-                "wss://test.com/ocpp",
-                extra_headers={"Authorization": "Bearer test_token"},
-                subprotocols=["ocpp1.6"],
-                ping_interval=30,
-                ping_timeout=10,
-            )
-
-            # Should create service client
-            assert "test_service" in service_manager.services
-            assert "test_service" in service_manager._connection_tasks
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_connect_service_basic_auth(self, service_manager):
-        """Test connecting to service with basic authentication."""
-        service_config = {
-            "id": "test_service",
-            "url": "wss://test.com/ocpp",
-            "auth_type": "basic",
-            "username": "testuser",
-            "password": "testpass",
-        }
-
-        with (
-            patch(
-                "src.ocpp_proxy.ocpp_service_manager.websockets.connect", new_callable=AsyncMock
-            ) as mock_connect,
-            patch(
-                "src.ocpp_proxy.ocpp_service_manager.OCPPServiceFactory.create_service_client"
-            ) as mock_factory,
-        ):
-            mock_connection = Mock()
-            mock_connect.return_value = mock_connection
-            mock_client = Mock()
-            mock_client.start = AsyncMock()
-            mock_factory.return_value = mock_client
-
-            await service_manager.connect_service("test_service", service_config)
-
-            # Should connect with basic auth header
-            call_args = mock_connect.call_args
-            headers = call_args[1]["extra_headers"]
-            assert "Authorization" in headers
-            assert headers["Authorization"].startswith("Basic ")
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_connect_service_no_auth(self, service_manager):
-        """Test connecting to service without authentication."""
-        service_config = {"id": "test_service", "url": "wss://test.com/ocpp", "auth_type": "none"}
-
-        with (
-            patch(
-                "src.ocpp_proxy.ocpp_service_manager.websockets.connect", new_callable=AsyncMock
-            ) as mock_connect,
-            patch(
-                "src.ocpp_proxy.ocpp_service_manager.OCPPServiceFactory.create_service_client"
-            ) as mock_factory,
-        ):
-            mock_connection = Mock()
-            mock_connect.return_value = mock_connection
-            mock_client = Mock()
-            mock_client.start = AsyncMock()
-            mock_factory.return_value = mock_client
-
-            await service_manager.connect_service("test_service", service_config)
-
-            # Should connect without auth headers
-            call_args = mock_connect.call_args
-            headers = call_args[1]["extra_headers"]
-            assert "Authorization" not in headers
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_connect_service_no_url(self, service_manager):
-        """Test connecting to service without URL."""
-        service_config = {"id": "test_service", "auth_type": "none"}
-
-        # Should not raise exception
-        await service_manager.connect_service("test_service", service_config)
-
-        # Should not create service
-        assert "test_service" not in service_manager.services
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_connect_service_connection_failure(self, service_manager):
-        """Test connecting to service with connection failure."""
-        service_config = {"id": "test_service", "url": "wss://test.com/ocpp", "auth_type": "none"}
-
-        with patch(
-            "src.ocpp_proxy.ocpp_service_manager.websockets.connect", new_callable=AsyncMock
-        ) as mock_connect:
-            mock_connect.side_effect = Exception("Connection failed")
-
-            # Should not raise exception
-            await service_manager.connect_service("test_service", service_config)
-
-            # Should not create service
-            assert "test_service" not in service_manager.services
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_disconnect_service(self, service_manager):
-        """Test disconnecting from service."""
-        # Create mock service
-        mock_client = Mock()
-        mock_client.connected = True
-        mock_client._connection = Mock()
-        mock_client._connection.close = AsyncMock()
-
-        mock_task = Mock()
-        mock_task.cancel = Mock()
-
-        service_manager.services["test_service"] = mock_client
-        service_manager._connection_tasks["test_service"] = mock_task
-
-        await service_manager.disconnect_service("test_service")
-
-        # Should disconnect client
-        mock_task.cancel.assert_called_once()
-        mock_client._connection.close.assert_called_once()
-
-        # Should remove from collections
-        assert "test_service" not in service_manager.services
-        assert "test_service" not in service_manager._connection_tasks
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_disconnect_service_not_found(self, service_manager):
-        """Test disconnecting from non-existent service."""
-        # Should not raise exception
-        await service_manager.disconnect_service("nonexistent_service")
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_request_control_from_service_success(self, service_manager):
-        """Test requesting control from service."""
-        # Mock charge point
-        mock_cp = Mock()
-        mock_cp.send_remote_start_transaction = AsyncMock(return_value=True)
-
-        service_manager.backend_manager._app = {"charge_point": mock_cp}
-
-        result = await service_manager.request_control_from_service(
-            "test_service", "RemoteStartTransaction", {"connector_id": 1, "id_tag": "RFID123"}
-        )
-
-        # Should request control
-        service_manager.backend_manager.request_control.assert_called_once_with(
-            "ocpp_service_test_service"
-        )
-
-        # Should call charge point
-        mock_cp.send_remote_start_transaction.assert_called_once_with(
-            connector_id=1, id_tag="RFID123"
-        )
-
-        assert result
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_request_control_from_service_rejected(self, service_manager):
-        """Test requesting control from service that gets rejected."""
-        service_manager.backend_manager.request_control.return_value = False
-
-        result = await service_manager.request_control_from_service(
-            "test_service", "RemoteStartTransaction", {"connector_id": 1, "id_tag": "RFID123"}
-        )
-
-        assert not result
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_request_control_from_service_no_backend_manager(self, mock_config):
-        """Test requesting control without backend manager."""
-        service_manager = OCPPServiceManager(mock_config)
-
-        result = await service_manager.request_control_from_service(
-            "test_service", "RemoteStartTransaction", {"connector_id": 1, "id_tag": "RFID123"}
-        )
-
-        assert not result
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_request_control_from_service_stop_transaction(self, service_manager):
-        """Test requesting control for stop transaction."""
-        # Mock charge point
-        mock_cp = Mock()
-        mock_cp.send_remote_stop_transaction = AsyncMock(return_value=True)
-
-        service_manager.backend_manager._app = {"charge_point": mock_cp}
-
-        result = await service_manager.request_control_from_service(
-            "test_service", "RemoteStopTransaction", {"transaction_id": 123}
-        )
-
-        # Should call charge point
-        mock_cp.send_remote_stop_transaction.assert_called_once_with(transaction_id=123)
-
-        assert result
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_request_control_from_service_exception(self, service_manager):
-        """Test requesting control with exception."""
-        # Mock charge point that raises exception
-        mock_cp = Mock()
-        mock_cp.send_remote_start_transaction = AsyncMock(side_effect=Exception("Call failed"))
-
-        service_manager.backend_manager._app = {"charge_point": mock_cp}
-
-        result = await service_manager.request_control_from_service(
-            "test_service", "RemoteStartTransaction", {"connector_id": 1, "id_tag": "RFID123"}
-        )
-
-        assert not result
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_broadcast_event_to_services(self, service_manager):
-        """Test broadcasting events to services."""
-        # Create mock services
-        mock_client1 = Mock()
-        mock_client1.connected = True
-        mock_client2 = Mock()
-        mock_client2.connected = True
-        mock_client3 = Mock()
-        mock_client3.connected = False
-
-        service_manager.services = {
-            "service1": mock_client1,
-            "service2": mock_client2,
-            "service3": mock_client3,
-        }
-
-        event = {"type": "test_event", "data": "test_data"}
-
-        with patch.object(service_manager, "_send_event_to_service") as mock_send:
-            service_manager.broadcast_event_to_services(event)
-
-            # Should send to connected services only
-            assert mock_send.call_count == 2
-            mock_send.assert_any_call(mock_client1, event)
-            mock_send.assert_any_call(mock_client2, event)
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_send_event_to_service_status(self, service_manager):
-        """Test sending status event to service."""
-        mock_client = Mock()
-        mock_client.service_id = "test_service"
-
-        event = {
-            "type": "status",
-            "connector_id": 1,
-            "status": "Available",
-            "error_code": "NoError",
-        }
-
-        # Should not raise exception (event is processed but not forwarded to service)
-        await service_manager._send_event_to_service(mock_client, event)
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_send_event_to_service_meter(self, service_manager):
-        """Test sending meter event to service."""
-        mock_client = Mock()
-        mock_client.service_id = "test_service"
-
-        event = {"type": "meter", "connector_id": 1, "values": [{"value": "1000"}]}
-
-        # Should not raise exception (event is processed but not forwarded to service)
-        await service_manager._send_event_to_service(mock_client, event)
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_send_event_to_service_transaction_started(self, service_manager):
-        """Test sending transaction started event to service."""
-        mock_client = Mock()
-        mock_client.service_id = "test_service"
-
-        event = {
-            "type": "transaction_started",
-            "connector_id": 1,
-            "id_tag": "RFID123",
-            "meter_start": 0,
-            "timestamp": "2023-01-01T12:00:00Z",
-        }
-
-        # Should not raise exception (event is processed but not forwarded to service)
-        await service_manager._send_event_to_service(mock_client, event)
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_send_event_to_service_transaction_stopped(self, service_manager):
-        """Test sending transaction stopped event to service."""
-        mock_client = Mock()
-        mock_client.service_id = "test_service"
-
-        event = {
-            "type": "transaction_stopped",
-            "transaction_id": 123,
-            "meter_stop": 5000,
-            "timestamp": "2023-01-01T13:00:00Z",
-        }
-
-        # Should not raise exception (event is processed but not forwarded to service)
-        await service_manager._send_event_to_service(mock_client, event)
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_send_event_to_service_exception(self, service_manager):
-        """Test sending event with exception."""
-        mock_client = Mock()
-        mock_client.service_id = "test_service"
-
-        event = {"type": "status", "connector_id": 1, "status": "Available"}
-
-        # Should not raise exception
-        await service_manager._send_event_to_service(mock_client, event)
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_stop_all_services(self, service_manager):
-        """Test stopping all services."""
-        # Create mock services
-        service_manager.services = {"service1": Mock(), "service2": Mock(), "service3": Mock()}
-
-        with patch.object(service_manager, "disconnect_service") as mock_disconnect:
-            await service_manager.stop_all_services()
-
-            # Should disconnect all services
-            assert mock_disconnect.call_count == 3
-            mock_disconnect.assert_any_call("service1")
-            mock_disconnect.assert_any_call("service2")
-            mock_disconnect.assert_any_call("service3")
-
-    @pytest.mark.unit
-    def test_get_service_status(self, service_manager):
-        """Test getting service status."""
-        # Create mock services
-        mock_client1 = Mock()
-        mock_client1.connected = True
-        mock_client1.authenticated = True
-        mock_client1.ocpp_version = "1.6"
-        mock_client2 = Mock()
-        mock_client2.connected = False
-        mock_client2.authenticated = False
-        mock_client2.ocpp_version = "2.0.1"
-
-        service_manager.services = {"service1": mock_client1, "service2": mock_client2}
-
-        status = service_manager.get_service_status()
-
-        assert status["service1"]["connected"]
-        assert status["service1"]["authenticated"]
-        assert status["service1"]["version"] == "1.6"
-        assert not status["service2"]["connected"]
-        assert not status["service2"]["authenticated"]
-        assert status["service2"]["version"] == "2.0.1"
+        assert status["z"]["read_only"] is True
+
+    async def test_no_services(self):
+        manager = OCPPServiceManager(self.make_config(None))
+        await manager.start_services()
+        assert manager.services == []
+        assert manager.primary is None
+        assert manager.get_service_status() == {}
+
+    async def test_attached_relay_reports_status_and_is_closed(self):
+        manager = OCPPServiceManager(self.make_config([]))
+        relay = Mock()
+        relay.link_status = Mock(return_value={"monta": {"connected": True}})
+        relay.close_links = AsyncMock()
+
+        manager.attach(relay)
+        assert manager.get_service_status() == {"monta": {"connected": True}}
+
+        session = await manager.get_session()
+        assert await manager.get_session() is session
+
+        await manager.stop_all_services()
+        relay.close_links.assert_awaited_once()
+        assert session.closed
+
+        manager.detach(Mock())  # another relay: ignored
+        assert manager.get_service_status() == {"monta": {"connected": True}}
+        manager.detach(relay)
+        assert manager.get_service_status() == {}
+
+    def test_tx_store_uses_env_path(self, tmp_path, monkeypatch):
+        path = tmp_path / "tx.json"
+        monkeypatch.setenv("TX_MAP_PATH", str(path))
+        manager = OCPPServiceManager(self.make_config([]))
+        manager.tx_store.set("monta", 1, 2)
+        assert path.exists()

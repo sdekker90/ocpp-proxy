@@ -111,35 +111,44 @@ blocked_providers: ["spammer"]                 # Optional blocklist
 
 # OCPP Services (Outbound Connections)
 ocpp_services:
-  - id: "energy_provider"
-    url: "ws://provider.com/ocpp"
-    version: "1.6"
-    auth_type: "basic"
-    username: "user"
-    password: "pass"
+  - id: "monta"
+    url: "wss://ocpp.example-monta-url"   # as given by the portal, WITHOUT the charger ID
+    primary: true                         # its answers go back to the charger
     enabled: true
-  
-  - id: "fleet_service"
-    url: "wss://fleet.com/ocpp/cp001"
-    version: "2.0.1"
-    auth_type: "token"
-    token: "bearer_token_here"
+
+  - id: "zeres"
+    url: "wss://ocpp.example-zeres-url"
+    read_only: true                       # receives data only; cannot control the charger
+    auth_type: "none"                     # none | basic | token
     enabled: true
 ```
 
-### Version Detection
-The proxy automatically detects OCPP versions through:
-- WebSocket subprotocol (`ocpp1.6`, `ocpp2.0.1`)
-- HTTP headers (`Sec-WebSocket-Protocol`, `X-OCPP-Version`)
-- URL query parameters (`?version=2.0.1`)
-- URL path patterns (`/charger/v2.0.1`)
+### Connecting the charger and services
+Set the charger's OCPP URL to `ws://<home-assistant-ip>:9000/charger`. Like most chargers it
+appends its own ID (e.g. `/charger/7000730523000060`). The proxy connects to every enabled
+service at `<service url>/<charger id>`, so register the same charger ID in each service's
+portal. Put `{charge_point_id}` in a service URL to place the ID elsewhere.
+
+How messages are relayed:
+- Everything the charger sends (boot, status, meter values, transactions) goes to all services.
+- The **primary** service (the one marked `primary: true`, otherwise the first) answers the
+  charger, so it decides on RFID authorization and transaction IDs. If it is unreachable, the
+  proxy answers itself (accepting the charger) and delivers transaction messages once the
+  service is back.
+- Requests from the primary (remote start/stop, configuration, charging profiles) are
+  forwarded to the charger. Remote starts are subject to the sharing rules (presence sensor,
+  override boolean, `allow_shared_charging`).
+- Non-primary services are **read-only** unless `read_only: false` is set; they may only read
+  configuration and trigger messages.
+- With OCPP 1.6 each service issues its own transaction IDs; the proxy translates them and
+  stores the mapping in `TX_MAP_PATH` so it survives restarts.
+- The OCPP version (1.6 or 2.0.1) follows the charger's WebSocket subprotocol.
 
 ## 🔌 API Endpoints
 
 ### WebSocket Endpoints
-- **`/charger`** - EV charger connection (CSMS role)
-  - Auto-detects OCPP version
-  - Supports query parameters: `?version=2.0.1`
+- **`/charger/<charger id>`** (or `/charger`) - EV charger connection (CSMS role)
+  - OCPP version from the WebSocket subprotocol (`ocpp1.6` / `ocpp2.0.1`)
 - **`/backend?id=backend_id`** - Backend service connections
   - Custom protocol for control requests and event subscriptions
 
@@ -157,12 +166,9 @@ The proxy automatically detects OCPP versions through:
 ```
 src/ocpp_proxy/
 ├── main.py                    # Application entry point & HTTP server
-├── charge_point_base.py       # Abstract base for version-agnostic interface
-├── charge_point_v16.py        # OCPP 1.6 implementation
-├── charge_point_v201.py       # OCPP 2.0.1 implementation
-├── charge_point_factory.py    # Version-specific instantiation
+├── relay.py                   # OCPP-J relay: charger <-> upstream services
 ├── backend_manager.py         # Multi-backend control arbitration
-├── ocpp_service_manager.py    # Outbound OCPP service connections
+├── ocpp_service_manager.py    # Service config, transaction ID map, shared session
 ├── config.py                  # Configuration management
 ├── ha_bridge.py              # Home Assistant API integration
 └── logger.py                 # Session tracking & persistence
@@ -171,7 +177,7 @@ src/ocpp_proxy/
 ### Protocol Differences Handled
 - **OCPP 1.6**: `RemoteStartTransaction`, `StartTransaction`/`StopTransaction`
 - **OCPP 2.0.1**: `RequestStartTransaction`, `TransactionEvent` (Started/Ended)
-- Automatic message format conversion and enum handling
+- Messages are relayed as raw OCPP-J; only 1.6 transaction IDs are rewritten
 
 ### Control Flow
 1. **Connection**: Charger connects → Version detected → Appropriate handler created

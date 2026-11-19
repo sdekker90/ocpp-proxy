@@ -43,18 +43,16 @@ OCPP Proxy is a WebSocket-based proxy server that enables intelligent EV charger
 ### Core Components
 
 - **`main.py`**: HTTP server, WebSocket handlers, REST API endpoints
-- **`charge_point_base.py`**: Abstract base class providing version-agnostic OCPP interface
-- **`charge_point_v16.py`/`charge_point_v201.py`**: OCPP 1.6 and 2.0.1 protocol implementations
-- **`charge_point_factory.py`**: Creates appropriate ChargePoint instances based on version detection
+- **`relay.py`**: Raw OCPP-J relay. `ChargerRelay` handles one charger connection; one `UpstreamLink` per configured service connects to `<url>/<charger id>`. Charger messages go to all services, the primary's answers go back to the charger, read-only services cannot control it; OCPP 1.6 transaction IDs are translated per service
 - **`backend_manager.py`**: Controls backend arbitration and manages single active control lock
-- **`ocpp_service_manager.py`**: Manages outbound connections to OCPP services
+- **`ocpp_service_manager.py`**: Service config parsing (primary/read-only), persistent transaction ID map, shared aiohttp session
 - **`ha_bridge.py`**: Home Assistant integration for monitoring and overrides
 - **`logger.py`**: Session tracking and SQLite persistence
 - **`config.py`**: YAML configuration management
 
 ### Key Architecture Patterns
 
-1. **Version Abstraction**: `ChargePointBase` provides unified interface; concrete classes handle protocol specifics
+1. **Transparent Relay**: Messages are forwarded as raw OCPP-J; the version follows the charger's WebSocket subprotocol
 2. **Control Arbitration**: Only one backend can control the charger at a time via `BackendManager`
 3. **Dual Connection Types**:
    - Inbound WebSocket backends (`/backend?id=backend_id`)
@@ -63,15 +61,17 @@ OCPP Proxy is a WebSocket-based proxy server that enables intelligent EV charger
 
 ### Protocol Version Detection
 
-Auto-detection occurs through:
-- WebSocket subprotocols (`ocpp1.6`, `ocpp2.0.1`)
-- HTTP headers (`Sec-WebSocket-Protocol`, `X-OCPP-Version`)
-- URL query parameters (`?version=2.0.1`)
-- URL path patterns (`/charger/v2.0.1`)
+The version is the WebSocket subprotocol the charger negotiates (`ocpp1.6`, `ocpp2.0.1`),
+falling back to the `ocpp_version` option. The same subprotocol is used towards the services.
+
+### Home Assistant add-on packaging
+
+The add-on in `ocpp-proxy/` builds from its own copy of the code in `ocpp-proxy/src/`; keep it
+in sync with `src/` and bump `version` in `ocpp-proxy/config.yaml` for every release.
 
 ### WebSocket Endpoints
 
-- **`/charger`**: EV charger connection (CSMS role) with auto-detection
+- **`/charger/<charger id>`** (or `/charger`): EV charger connection (CSMS role), relayed to the configured OCPP services
 - **`/backend?id=backend_id`**: Backend service connections with custom control protocol
 
 ### Testing Requirements

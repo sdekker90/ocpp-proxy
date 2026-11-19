@@ -1,4 +1,5 @@
 import os
+from typing import Any
 
 import yaml
 
@@ -66,7 +67,7 @@ class Config:
         return int(self._cfg.get("rate_limit_seconds", 10))
 
     @property
-    def ocpp_services(self) -> list[dict[str, str]]:
+    def ocpp_services(self) -> list[dict[str, Any]]:
         """Return list of OCPP service configurations for outbound connections."""
         value = self._cfg.get("ocpp_services", [])
         return list(value) if value is not None else []

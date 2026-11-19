@@ -1,7 +1,7 @@
 name: OCPP Proxy
-version: '0.1.4'
+version: '0.2.0'
 slug: ocpp-proxy
-description: 'OCPP 1.6 JSON WebSocket proxy for EV charger sharing'
+description: 'OCPP proxy that relays one EV charger to multiple OCPP services'
 homeassistant_api: true
 init: false
 arch:
@@ -37,6 +37,8 @@ schema:
   ocpp_services:
     - id: str
       url: str
+      primary: bool?
+      read_only: bool?
       auth_type: list(none|basic|token)?
       username: str?
       password: str?

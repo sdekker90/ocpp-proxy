@@ -43,6 +43,7 @@ class TestMainApplication(AioHTTPTestCase):
         with patch.dict(os.environ, {"HA_URL": "", "HA_TOKEN": ""}):
             with patch("src.ocpp_proxy.main.OCPPServiceManager") as mock_ocpp_manager:
                 mock_ocpp_manager.return_value.start_services = AsyncMock()
+                mock_ocpp_manager.return_value.stop_all_services = AsyncMock()
                 mock_ocpp_manager.return_value.get_service_status = Mock(return_value={})
                 return await init_app()
 
@@ -193,21 +194,34 @@ class TestMainApplication(AioHTTPTestCase):
 
     @pytest.mark.integration
     async def test_charger_handler_websocket(self):
-        """Test the charger WebSocket handler."""
-        # This is a complex test as it involves WebSocket connections
-        # We'll mock the WebSocket and ChargePoint
-        with patch("src.ocpp_proxy.main.ChargePointFactory.create_charge_point") as mock_cp_factory:
-            mock_cp = Mock()
-            mock_cp.start = AsyncMock()
-            mock_cp_factory.return_value = mock_cp
+        """The charger can connect with its ID in the path and the OCPP subprotocol."""
+        with patch("src.ocpp_proxy.main.ChargerRelay") as mock_relay_cls:
+            mock_relay_cls.return_value.run = AsyncMock()
 
-            # Create a mock WebSocket connection
-            async with self.client.ws_connect("/charger") as ws:
-                # The connection should be established
-                assert not ws.closed
+            async with self.client.ws_connect(
+                "/charger/7000730523000060", protocols=("ocpp1.6",)
+            ) as ws:
+                assert ws.protocol == "ocpp1.6"
+                await ws.receive()  # handler closes once the (mocked) relay returns
 
-                # Close the connection
-                await ws.close()
+            args = mock_relay_cls.call_args[0]
+            assert args[0] == "7000730523000060"
+            assert args[2] == "1.6"
+            mock_relay_cls.return_value.run.assert_awaited_once()
+            assert "charge_point" not in self.app
+
+    @pytest.mark.integration
+    async def test_charger_handler_without_id(self):
+        """A charger connecting to plain /charger gets a default ID."""
+        with patch("src.ocpp_proxy.main.ChargerRelay") as mock_relay_cls:
+            mock_relay_cls.return_value.run = AsyncMock()
+
+            async with self.client.ws_connect("/charger", protocols=("ocpp2.0.1",)) as ws:
+                await ws.receive()
+
+            args = mock_relay_cls.call_args[0]
+            assert args[0] == "CP-1"
+            assert args[2] == "2.0.1"
 
     @pytest.mark.integration
     async def test_backend_handler_websocket(self):
@@ -553,6 +567,7 @@ class TestMainApplicationInitialization:
 
             assert "/" in route_paths
             assert "/charger" in route_paths
+            assert "/charger/{cp_id}" in route_paths
             assert "/backend" in route_paths
             assert "/sessions" in route_paths
             assert "/sessions.csv" in route_paths

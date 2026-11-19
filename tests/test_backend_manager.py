@@ -35,7 +35,6 @@ class TestBackendManager:
     def mock_ocpp_service_manager(self):
         """Create a mock OCPP service manager."""
         manager = Mock()
-        manager.broadcast_event_to_services = Mock()
         manager.get_service_status = Mock(return_value={"service1": {"connected": True}})
         return manager
 
@@ -85,51 +84,48 @@ class TestBackendManager:
         assert backend_manager._lock_owner is None
 
     @pytest.mark.unit
-    def test_broadcast_event_websocket_only(self, backend_manager):
-        """Test broadcasting events to WebSocket subscribers only."""
+    async def test_broadcast_event_websocket_only(self, backend_manager):
+        """Test broadcasting events to WebSocket subscribers."""
         mock_ws1 = Mock(spec=web.WebSocketResponse)
         mock_ws2 = Mock(spec=web.WebSocketResponse)
-        mock_ws1.send_json = Mock()
-        mock_ws2.send_json = Mock()
+        mock_ws1.send_json = AsyncMock()
+        mock_ws2.send_json = AsyncMock()
 
         backend_manager.subscribe("backend1", mock_ws1)
         backend_manager.subscribe("backend2", mock_ws2)
 
         event = {"type": "test_event", "data": "test_data"}
-        backend_manager.broadcast_event(event)
+        await backend_manager.broadcast_event(event)
 
-        mock_ws1.send_json.assert_called_once_with(
-            {"type": "event", "type": "test_event", "data": "test_data"}
-        )
-        mock_ws2.send_json.assert_called_once_with(
-            {"type": "event", "type": "test_event", "data": "test_data"}
-        )
+        mock_ws1.send_json.assert_called_once_with({"type": "test_event", "data": "test_data"})
+        mock_ws2.send_json.assert_called_once_with({"type": "test_event", "data": "test_data"})
 
     @pytest.mark.unit
-    def test_broadcast_event_with_ocpp_services(self, backend_manager):
-        """Test broadcasting events to both WebSocket and OCPP services."""
+    async def test_broadcast_event_not_sent_to_ocpp_services(self, backend_manager):
+        """OCPP services get raw OCPP from the relay, not backend events."""
         mock_ws = Mock(spec=web.WebSocketResponse)
-        mock_ws.send_json = Mock()
+        mock_ws.send_json = AsyncMock()
         backend_manager.subscribe("backend1", mock_ws)
 
-        event = {"type": "test_event", "data": "test_data"}
-        backend_manager.broadcast_event(event)
+        await backend_manager.broadcast_event({"type": "test_event"})
 
         mock_ws.send_json.assert_called_once()
-        backend_manager.ocpp_service_manager.broadcast_event_to_services.assert_called_once_with(
-            event
-        )
+        assert backend_manager.ocpp_service_manager.method_calls == []
 
     @pytest.mark.unit
-    def test_broadcast_event_websocket_failure(self, backend_manager):
+    async def test_broadcast_event_websocket_failure(self, backend_manager):
         """Test broadcasting events when WebSocket fails."""
-        mock_ws = Mock(spec=web.WebSocketResponse)
-        mock_ws.send_json = Mock(side_effect=Exception("WebSocket error"))
-        backend_manager.subscribe("backend1", mock_ws)
+        failing_ws = Mock(spec=web.WebSocketResponse)
+        failing_ws.send_json = AsyncMock(side_effect=Exception("WebSocket error"))
+        working_ws = Mock(spec=web.WebSocketResponse)
+        working_ws.send_json = AsyncMock()
+        backend_manager.subscribe("backend1", failing_ws)
+        backend_manager.subscribe("backend2", working_ws)
 
-        event = {"type": "test_event"}
         # Should not raise exception
-        backend_manager.broadcast_event(event)
+        await backend_manager.broadcast_event({"type": "test_event"})
+
+        working_ws.send_json.assert_called_once()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -424,15 +420,13 @@ class TestBackendManager:
         assert backend_manager._lock_owner.startswith("backend")
 
     @pytest.mark.unit
-    def test_broadcast_event_no_ocpp_manager(self, mock_config):
+    async def test_broadcast_event_no_ocpp_manager(self, mock_config):
         """Test broadcasting events without OCPP service manager."""
         backend_manager = BackendManager(mock_config)
         mock_ws = Mock(spec=web.WebSocketResponse)
-        mock_ws.send_json = Mock()
+        mock_ws.send_json = AsyncMock()
         backend_manager.subscribe("backend1", mock_ws)
 
-        event = {"type": "test_event"}
-        backend_manager.broadcast_event(event)
+        await backend_manager.broadcast_event({"type": "test_event"})
 
         mock_ws.send_json.assert_called_once()
-        # Should not raise exception even without OCPP manager

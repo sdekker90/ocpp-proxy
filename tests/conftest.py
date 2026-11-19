@@ -167,21 +167,6 @@ def mock_websocket():
     return ws
 
 
-@pytest.fixture
-def mock_charge_point():
-    """Create a mock charge point."""
-    cp = Mock()
-    cp.call_remote_start_transaction = AsyncMock()
-    cp.call_remote_stop_transaction = AsyncMock()
-    cp.call_boot_notification = AsyncMock()
-    cp.call_heartbeat = AsyncMock()
-    cp.call_status_notification = AsyncMock()
-    cp.call_meter_values = AsyncMock()
-    cp.call_start_transaction = AsyncMock()
-    cp.call_stop_transaction = AsyncMock()
-    return cp
-
-
 @pytest.fixture(autouse=True)
 def clean_environment():
     """Clean environment variables before each test."""
@@ -207,11 +192,8 @@ def mock_ocpp_service_manager():
     manager = Mock()
     manager.start_services = AsyncMock()
     manager.stop_all_services = AsyncMock()
-    manager.connect_service = AsyncMock()
-    manager.disconnect_service = AsyncMock()
-    manager.broadcast_event_to_services = Mock()
     manager.get_service_status = Mock(return_value={})
-    manager.services = {}
+    manager.services = []
     return manager
 
 
